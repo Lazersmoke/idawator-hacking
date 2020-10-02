@@ -16,13 +16,16 @@ canvas.pianoroll{
   grid-column: 1;
 }
 #canvasHolder{
+  width: 200px;
   display: grid;
   grid-column: 2;
+}
+#summaryArea{
+  grid-column: 3;
 }
 #summaryBox{
   width: 900px;
   height: 300px;
-  grid-column: 3;
 }
 </style>
   </head>
@@ -30,7 +33,10 @@ canvas.pianoroll{
     <div style="display: grid">
       <div id="controlArea"></div>
       <div id="canvasHolder"></div>
-      <textarea id="summaryBox"></textarea>
+      <div id="summaryArea">
+        <textarea id="summaryBox"></textarea>
+        <div id="deltaBox"></div>
+      </div>
       <div id="tfvisThing" style="grid-column: 4"></div>
     </div>
   </body>

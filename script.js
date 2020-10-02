@@ -15,6 +15,7 @@ const modelDecode = xs => {
 
 var currentBaseZ = undefined;
 var isPlaying = false
+var lastDeltas = []
 
 window.onload = () => {
   const controls = document.getElementById("controlArea")
@@ -74,27 +75,40 @@ function regenExamples(base){
 
   document.getElementById("summaryBox").innerHTML = perturbs.toString() + "\n\n" + getSumStats(perturbs).toString()
   tfvis.render.heatmap(document.getElementById("tfvisThing"),{values: getSumStats(perturbs)})
-  const baseSequence = modelDecode(base.expandDims())
-  const outputSequences = modelDecode(perturbed)
+
+  const deltaBox = document.getElementById("deltaBox")
+  while (deltaBox.firstChild) {
+    deltaBox.removeChild(deltaBox.lastChild);
+  }
+  lastDeltas.forEach(d => {
+    const deltaLabel = document.createTextNode(d.delta.toString())
+    deltaBox.appendChild(deltaLabel)
+
+    const deltaRepeatButton = document.createElement("input")
+    deltaRepeatButton.type = "button"
+    deltaRepeatButton.value = "Repeat " + d.name
+    deltaRepeatButton.addEventListener("click",() => {
+      currentBaseZ = currentBaseZ.add(d.delta)
+      regenExamples(currentBaseZ)
+    })
+    deltaBox.appendChild(deltaRepeatButton)
+    deltaBox.appendChild(document.createElement("br"))
+  })
 
   const canvHolder = document.getElementById("canvasHolder")
   while (canvHolder.firstChild) {
     canvHolder.removeChild(canvHolder.lastChild);
   }
 
-  baseSequence.then(samples => {
-    // Only one base sequence
-    displaySequence(samples[0],base,"Base")
-  })
-  outputSequences.then(samples => {
-    samples.forEach((notes,i) => {
-      displaySequence(notes, perturbed.slice(i,1).squeeze(), "Perturbation #" + (i + 1))
-    })
-  });
+  displaySequence(base,tf.zeros([ZDIMS]),"Base")
+  for(var i = 0; i < numPerturb; i++){
+    displaySequence(perturbed.slice(i,1).squeeze(),perturbs.slice(i,1).squeeze(), "Perturbation #" + (i + 1))
+  }
 }
 
-function displaySequence(seq,zCode,name = "Unamed Note Sequence"){
-  seq = core.sequences.unquantizeSequence(seq)
+async function displaySequence(seq,zCode,deltaCode,name = "Unamed Note Sequence"){
+  const seqQuantized = await modelDecode(zCode.expandDims())
+  seq = core.sequences.unquantizeSequence(seqQuantized[0])
   const canvLabel = document.createElement("span")
   const canvLabelText = document.createTextNode(name)
   canvLabel.appendChild(canvLabelText)
@@ -107,6 +121,7 @@ function displaySequence(seq,zCode,name = "Unamed Note Sequence"){
   changeButton.value = "Use " + name
   changeButton.addEventListener("click",() => {
     currentBaseZ = zCode.clone()
+    lastDeltas.push({delta: deltaCode, name: name})
     regenExamples(currentBaseZ)
   })
   document.getElementById("canvasHolder").appendChild(canvLabel)
