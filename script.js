@@ -99,14 +99,15 @@ function regenExamples(base){
   while (canvHolder.firstChild) {
     canvHolder.removeChild(canvHolder.lastChild);
   }
-
-  displaySequence(base,tf.zeros([ZDIMS]),"Base")
-  for(var i = 0; i < numPerturb; i++){
-    displaySequence(perturbed.slice(i,1).squeeze(),perturbs.slice(i,1).squeeze(), "Perturbation #" + (i + 1))
-  }
+  (async () => {
+    await displaySequence(base,tf.zeros([ZDIMS]),"Base")
+    for(var i = 0; i < numPerturb; i++){
+      await displaySequence(perturbed.slice(i,1).squeeze(),perturbs.slice(i,1).squeeze(), "Perturbation #" + (i + 1))
+    }
+  })()
 }
 
-async function displaySequence(seq,zCode,deltaCode,name = "Unamed Note Sequence"){
+async function displaySequence(zCode,deltaCode,name = "Unamed Note Sequence"){
   const seqQuantized = await modelDecode(zCode.expandDims())
   seq = core.sequences.unquantizeSequence(seqQuantized[0])
   const canvLabel = document.createElement("span")
@@ -194,3 +195,6 @@ function getSumStats(deltas){
   })
 }
 
+function differentiate(baseZ,f,h=0.001){
+
+}
