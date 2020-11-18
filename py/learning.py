@@ -19,6 +19,7 @@ fockOffsets = []
 for i in range(fockSize):
   fockOffsets.append(totalFockSize)
   totalFockSize += (i + 1) * singleNoteSize
+fockOffsets.append(totalFockSize)
 
 # Add in the time density
 maxTimeDensity = 200
@@ -132,8 +133,12 @@ def fileToData(filename):
       dataset.concatenate(mkDatasetFromTrack(track))
   return dataset
 
+max_files = 5
 dataset = None
 for filename in os.listdir("midis"):
+  max_files -= 1
+  if max_files < 0:
+    break
   fullPath = os.path.join("midis",filename)
   print("Using",fullPath)
   try:
@@ -146,7 +151,7 @@ for filename in os.listdir("midis"):
     print("!!! Error dealing with midi file:",fullPath)
     print("!!!",err)
 
-dataset = dataset.cache("datacache")
+dataset = dataset.shuffle(100)
 print("Dataset cardinality:",dataset.cardinality().numpy())
 
 
@@ -199,17 +204,33 @@ def displayAbout(model):
     plt.show(block=True)
 
 def lossfn(actual, pred):
-  if useCategoricalTime:
-    return tf.keras.losses.categorical_crossentropy(actual, pred, from_logits=True)
-  else:
-    predTimeDensity = pred[:,:,0]
-    actualTimeDensity = actual[:,:,0]
-    alpha = 0.2
-    timeLoss = (predTimeDensity - actualTimeDensity) * (predTimeDensity - actualTimeDensity)
-    beta = 0.5
-    timeShapeLoss = tf.keras.losses.kullback_leibler_divergence(actualTimeDensity,predTimeDensity)
-    cce = tf.keras.losses.categorical_crossentropy(actual[:,:,1:], pred[:,:,1:], from_logits=True)
-    return alpha * timeLoss + cce
+  predTimeDensity = pred[:,:,0]
+  actualTimeDensity = actual[:,:,0]
+  alpha = 0.2
+  timeLoss = (predTimeDensity - actualTimeDensity) * (predTimeDensity - actualTimeDensity)
+  beta = 0.5
+  timeShapeLoss = tf.keras.losses.kullback_leibler_divergence(actualTimeDensity,predTimeDensity)
+  fockProbsAct = []
+  fockProbsPre = []
+  cce = []
+  for i in range(fockSize):
+    startIdx = 1 + fockOffsets[i]
+    endIdx = 1 + fockOffsets[i + 1]
+    fockProbsAct.append(tf.keras.backend.sum(actual[:,:,startIdx : endIdx],axis=2))
+    fockProbsPre.append(tf.keras.backend.sum(pred[:,:,startIdx : endIdx],axis=2))
+    cce.append(tf.keras.losses.categorical_crossentropy(actual[:,:,startIdx : endIdx], pred[:,:, startIdx : endIdx], from_logits=True))
+  fockProbsActTensor = tf.keras.backend.stack(fockProbsAct,axis=2)
+  fockProbsPreTensor = tf.keras.backend.stack(fockProbsPre,axis=2)
+  cceTensor = tf.keras.backend.stack(cce,axis=2)
+  actualFockIdx = tf.math.argmax(fockProbsActTensor,axis=2)
+  # This is the entropy from correctly categorizing the number of notes to play simultaneously
+  fockIndexEntropy = -tf.math.log(tf.gather(fockProbsPreTensor,actualFockIdx,batch_dims=2))
+
+  cceEntropy = tf.gather(cceTensor,actualFockIdx,batch_dims=2)
+
+  #cce = tf.keras.losses.categorical_crossentropy(actual[:,:,1:], pred[:,:,1:], from_logits=True)
+  return alpha * timeLoss + fockIndexEntropy + cceEntropy
+
 
 model.compile(optimizer='adam', loss=lossfn, metrics=['accuracy'])
 
@@ -226,7 +247,7 @@ checkpoint_callback = tf.keras.callbacks.ModelCheckpoint(
 if input("Go?") != "y":
   quit()
 
-model.load_weights(tf.train.latest_checkpoint(checkpoint_dir))
+#model.load_weights(tf.train.latest_checkpoint(checkpoint_dir))
 
 displayAbout(model)
 
