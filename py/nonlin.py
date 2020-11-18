@@ -115,6 +115,25 @@ def applyNonlinear(a,x):
   restMap = a[1:,:,:]
   return applyNonlinear(restMap,relu(np.einsum("ij,j",thisMap,biasX)))
 
+
+def backProp(expected,a,x0):
+  activations = np.zeros(a.shape[0:1])
+  for layer in range(a.shape[0]):
+    if layer > 0:
+      biasX = np.append(1,activations[layer - 1,:])
+    else:
+      biasX = np.append(1,x0)
+    activations[layer,:] = np.einsum("ij,j",a[layer,:,:],biasX)
+  deltas = np.zeros(activations.shape)
+  deltas[-1,:] = activations[-1,:] - expected
+  for layer in reverse(range(a.shape[0])):
+    acts = activations[layer - 1,:].shape
+    actMuls = np.ones(acts.shape)
+    actMuls[acts < 0] = 0
+    deltas[layer - 1,:] = np.einsum("kj,ij,i",np.diag(actMuls),a[layer,:,:],deltas[layer,:])
+  return deltas
+
+
 #sampNonLin = 2 * np.random.rand(5,6,8) - 1
 #sampInput = np.ones(5)
 #print(applyNonlinear(sampNonLin,sampInput))
@@ -145,8 +164,6 @@ def doTestNonLin():
   print("Decoded as:",decVal)
   print("Training bias was:",trainingBias)
   print("Reconstruction Loss:",np.linalg.norm(newExample - decVal))
-
-doTestNonLin()
 
 
 def doSaxStuff():

@@ -1,0 +1,5 @@
+py/midis
+py/training_checkpoints
+py/__pycache__
+py/*ckpt*
+py/*.mid

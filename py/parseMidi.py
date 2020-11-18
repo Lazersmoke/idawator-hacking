@@ -7,8 +7,9 @@ from scipy.special import binom
 from mido import MidiFile
 import itertools
 
+import nonlin
 
-fockSize = 7
+fockSize = 10
 # Pitch class, octave
 sizeOfNoteSpec = 12 + 1
 sizeOfFockNoteSpec = 0
@@ -83,7 +84,7 @@ for i, track in enumerate(mid.tracks):
       #print()
       #print("Held",heldNotes,"with these ones decaying:",toUnHold,"for time:",lastTime)
       #print()
-      noteSpecs.append(mkNoteSpec(heldNotes,toUnHold,lastTime))
+      noteSpecs.append(mkNoteSpec(heldNotes,toUnHold,min(lastTime,300)))
       #print(traceNoteSpec(noteSpecs[-1]))
       for n in toUnHold:
         heldNotes.remove(n)
@@ -100,11 +101,82 @@ for i, track in enumerate(mid.tracks):
     else:
       #print(msg)
       x=1
-  tracks.append(noteSpecs)
+  tracks.append(np.stack(noteSpecs,axis=0))
   print("Found {} Note Specs\n".format(len(noteSpecs)))
 
 
 # Memoryless predictor network
 def stepPredictLoss(predictor,track):
+  print("Finding step loss...")
+  totalLoss = 0
+  lastNoteSpec = None
   for noteSpec in track:
-    d
+    if lastNoteSpec is not None:
+      predicted = nonlin.applyNonlinear(predictor,lastNoteSpec)
+      totalLoss += np.linalg.norm(predicted - noteSpec)
+    lastNoteSpec = noteSpec
+  return totalLoss
+
+def timePredictLoss(predictor,track):
+  totalLoss = 0
+  for k in range(track.shape[0] - predictorSideLength):
+    i = k + predictorSideLength
+    predicted = nonlin.applyNonlinear(predictor,track[k:i,0])[0]
+    totalLoss += np.abs(predicted - track[i,0]) ** 2
+  return np.log(totalLoss)
+
+def plotTimePredictLoss(predictor,track):
+  totalLoss = 0
+  losses = []
+  ks = range(track.shape[0] - predictorSideLength)
+  for k in ks:
+    i = k + predictorSideLength
+    predicted = nonlin.applyNonlinear(predictor,track[k:i,0])[0]
+    totalLoss += np.abs(predicted - track[i,0]) ** 2
+    losses.append(totalLoss)
+  return losses
+
+
+
+predictorDepth = 2
+predictorSideLength = 3
+identityPredictor = nonlin.identityNonLin(sizeEpoch,predictorDepth)
+identityTimePredictor = nonlin.identityNonLin(predictorSideLength,predictorDepth)
+print("Computing identity time loss on Track 1...")
+print("Total Loss",timePredictLoss(identityTimePredictor,tracks[1]))
+
+def minCB(params):
+  predictor = nonlin.deserializeNonLin(params,predictorSideLength,predictorDepth)
+  print(predictor)
+  for l in range(10):
+    k = l + 200
+    i = k + predictorSideLength
+    predicted = nonlin.applyNonlinear(predictor,tracks[1][k:i,0])[0]
+    print("Predicted: ",predicted)
+    print("Actual: ",tracks[1][i,0])
+    print("Loss: ",np.abs(predicted - tracks[1][i,0]) ** 2)
+    print()
+  print("Step Loss: ",timePredictLoss(predictor,tracks[1]))
+  allLosses.append(plotTimePredictLoss(predictor,tracks[1]))
+
+def toMinimize(params):
+  predictor = nonlin.deserializeNonLin(params,predictorSideLength,predictorDepth)
+  return timePredictLoss(predictor,tracks[1])
+
+input("...")
+allLosses = []
+minResult = minimize(toMinimize,nonlin.serializeNonLin(identityTimePredictor),callback=minCB,options={'disp':True,'maxiter':10})
+print(minResult)
+
+for i in range(len(allLosses)):
+  losses = allLosses[i]
+  plt.plot(range(len(losses)),losses, color = str(1-(i/len(allLosses))))
+
+plt.title('Cumulative loss during track, progressive iterations')
+plt.xlabel('Note in Track')
+plt.ylabel('Cumulative Loss')
+plt.show(block=True)
+
+plt.hist(np.diff(allLosses[-1]))
+plt.title('Distribution of losses')
+plt.show(block=True)
