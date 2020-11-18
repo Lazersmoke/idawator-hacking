@@ -11,7 +11,7 @@ import os
 def midiNoteToRepr(midiNote):
   return divmod(midiNote,12)
 
-fockSize = 8
+fockSize = 10
 # 12 pitch classes, and 11 octaves
 singleNoteSize = 12 + 11
 totalFockSize = 0
@@ -44,8 +44,7 @@ def mkNoteSpec(heldNotes,decayingNotes,timeDensity):
   allNotes = heldNotes + decayingNotes
   fockVec = np.zeros(totalFockSize)
   if len(allNotes) > fockSize:
-    print("!!! Fock size of {} exceeded by {} simultaneous notes; dropping {} notes !!!".format(fockSize,len(allNotes), len(allNotes) - fockSize))
-    return None
+    #print("!!! Fock size of {} exceeded by {} simultaneous notes; dropping {} notes !!!".format(fockSize,len(allNotes), len(allNotes) - fockSize))
     allNotes = allNotes[:fockSize]
   startIdx = fockOffsets[len(allNotes) - 1]
   for i in range(len(allNotes)):
@@ -57,24 +56,20 @@ def mkNoteSpec(heldNotes,decayingNotes,timeDensity):
   else:
     return np.insert(fockVec,0,timeDensity)
 
-def getTracksFromMidi(filename):
+def getTracksFromMidi(filename,verbose=False):
   mid = MidiFile(filename)
   tracks = []
   minTrackSize = 200
   for i, track in enumerate(mid.tracks):
-    print('Track {}: {}'.format(i, track.name))
+    if verbose:
+      print('Track {}: {}'.format(i, track.name))
     heldNotes = []
     toUnHold = []
     lastTime = 0
     noteSpecs = []
-    hasFockError = False
     for msg in track:
       if msg.time != 0:
         noteSpec = mkNoteSpec(heldNotes,toUnHold,min(lastTime,maxTimeDensity))
-        if noteSpec is None:
-          print("!!! Track discarded due to fock error")
-          hasFockError = True
-          break
         noteSpecs.append(noteSpec)
         for n in toUnHold:
           if n in heldNotes:
@@ -92,13 +87,14 @@ def getTracksFromMidi(filename):
       else:
         #print(msg)
         x=1
-    print("Found {} Note Specs".format(len(noteSpecs)))
-    if(len(noteSpecs) >= minTrackSize and not hasFockError):
+    if verbose:
+      print("Found {} Note Specs".format(len(noteSpecs)))
+    if(len(noteSpecs) >= minTrackSize):
       tracks.append(np.stack(noteSpecs,axis=0))
-    else:
+    elif verbose:
       print("Track Discarded XXX")
-    print()
   return tracks
+
 def mkDatasetFromTrack(noteSequence):
   # The maximum length sentence you want for a single input in characters
   seq_length = 20
@@ -150,6 +146,7 @@ for filename in os.listdir("midis"):
     print("!!! Error dealing with midi file:",fullPath)
     print("!!!",err)
 
+dataset = dataset.cache("datacache")
 print("Dataset cardinality:",dataset.cardinality().numpy())
 
 
@@ -160,7 +157,8 @@ print("Dataset cardinality:",dataset.cardinality().numpy())
 #  print(tracks[1][:,0])
 
 model = keras.Sequential()
-model.add(layers.LSTM(1024,return_sequences=True,input_shape=(None,noteSpecSize)))
+model.add(layers.InputLayer(input_shape=(None,noteSpecSize)))
+model.add(layers.Bidirectional(layers.LSTM(512,return_sequences=True)))
 model.add(layers.Dropout(0.2))
 model.add(layers.Dense(noteSpecSize,activation = 'relu'))
 
@@ -181,7 +179,7 @@ def displayBatch(batch,from_logits=False,title=""):
     probs = batch[:,1:]
   #print(probs)
   #print(probs.shape)
-  plt.scatter(range(len(probs[0])),np.log(probs[0]))
+  plt.scatter(range(len(probs[-1])),np.log(probs[-1] + 1))
 
 def displayAbout(model):
   for input_example_batch, target_example_batch in dataset.take(1):
@@ -228,7 +226,7 @@ checkpoint_callback = tf.keras.callbacks.ModelCheckpoint(
 if input("Go?") != "y":
   quit()
 
-#model.load_weights(tf.train.latest_checkpoint(checkpoint_dir))
+model.load_weights(tf.train.latest_checkpoint(checkpoint_dir))
 
 displayAbout(model)
 
@@ -236,4 +234,19 @@ model.fit(dataset, epochs=10, callbacks=[checkpoint_callback])
 
 #model.evaluate(dataset)
 displayAbout(model)
+
+def writeBatch(batch,from_logits=False,title=""):
+  heldNotes = []
+  for i in range(len(batch[:,0])):
+    timeDensity = batch[i,0]
+  #print("Time densities:")
+  #print(batch[:,0].numpy())
+  #if from_logits:
+  #  probs = tf.nn.softmax(batch[:,1:]).numpy()
+  #else:
+  #  probs = batch[:,1:]
+  #print(probs)
+  #print(probs.shape)
+  #plt.scatter(range(len(probs[0])),np.log(probs[0]))
+
 
