@@ -4,6 +4,7 @@ import tensorflow as tf
 from tensorflow import keras
 from tensorflow.keras import layers
 from mido import MidiFile, Message, MidiTrack
+from itertools import permutations
 import os
 
 np.set_printoptions(precision=2)
@@ -166,13 +167,15 @@ def fileToData(filename):
 
 # Use up to this many files from the "midis" folder
 # to build the database of examples
-max_files = 100
+max_files = 20
 dataset = None
-for filename in os.listdir("midis"):
+midiFiles = os.listdir("clean_midi")
+np.random.shuffle(midiFiles)
+for filename in midiFiles:
   max_files -= 1
   if max_files < 0:
     break
-  fullPath = os.path.join("midis",filename)
+  fullPath = os.path.join("clean_midi",filename)
   if not os.path.isfile(fullPath):
     continue
   print("Using",fullPath)
@@ -280,8 +283,9 @@ def displayBatch(batch,from_logits=True,title="batch"):
     probs = tf.nn.softmax(batch[:,1:]).numpy()
   else:
     # Add epsilon to not break the plot axis
-    probs = batch[:,1:] + 1e-7
-  plt.scatter(range(len(probs[-1])),np.log(probs[-1]),label=title)
+    probs = batch[:,1:]
+  plt.scatter(range(len(probs[-1])),probs[-1],label=title)
+  plt.yscale('log')
   writeBatch(batch,from_logits)
 
 # Display some information about the model with
@@ -306,6 +310,10 @@ def displayAbout(model,title="Model"):
     plt.title(title)
     plt.legend()
     plt.show(block=True)
+
+    # Plot the distribution of time density predictions over the whole batch vs the target
+    # They should match for good networks, and if it just learns the time density mean, that
+    # tells you it's bad
     plt.title("Time density distribution comparison for " + title)
     plt.hist([target[0][:,0],predict[0][:,0]],label=["Target time density distribution","Predicted time density distribution"])
     #plt.vlines([np.mean(input_example_batch[0][:,0])],label="Mean actual time density")
@@ -333,12 +341,23 @@ def lossfn(actual, pred):
   for i in range(fockSize):
     startIdx = 1 + fockOffsets[i]
     endIdx = 1 + fockOffsets[i + 1]
+
+    logSoftPred = -tf.keras.backend.log(tf.nn.softmax(pred[:,:, startIdx : endIdx]))
+
     fockProbsAct.append(tf.keras.backend.sum(actual[:,:,startIdx : endIdx],axis=2))
-    fockProbsPre.append(tf.keras.backend.sum(tf.nn.softmax(pred[:,:,startIdx : endIdx]),axis=2))
+    fockProbsPre.append(tf.keras.backend.sum(logSoftPred,axis=2))
+
+    chunkOnNotesAct = tf.stack(tf.split(actual[:,:,startIdx : endIdx],singleNoteSize,axis=2),axis=0)
+    chunkOnNotesPred = tf.stack(tf.split(logSoftPred,singleNoteSize,axis=2),axis=0)
+
+    symmedAct = tf.keras.backend.mean(chunkOnNotesAct,axis=0)
+    symmedPred = tf.keras.backend.mean(chunkOnNotesPred,axis=0)
 
     # Hacky way to make it compute the p \cdot log q stuff
-    stacked = tf.stack([actual[:,:,startIdx : endIdx], tf.keras.backend.log(tf.nn.softmax(pred[:,:, startIdx : endIdx]))],axis=2)
-    cce.append(tf.keras.backend.sum(-tf.keras.backend.prod(stacked,axis = 2),axis=2))
+
+    # Make a stack on axis=0 of [actual,log(softmax(pred))], then tf.prod along axis=0
+    stacked = tf.stack([symmedAct, symmedPred],axis=0)
+    cce.append(tf.keras.backend.sum(tf.keras.backend.prod(stacked,axis = 0),axis=2))
 
   fockProbsActTensor = tf.keras.backend.stack(fockProbsAct,axis=2)
   fockProbsPreTensor = tf.keras.backend.stack(fockProbsPre,axis=2)
@@ -351,7 +370,7 @@ def lossfn(actual, pred):
   cceEntropy = tf.gather(cceTensor,actualFockIdx,batch_dims=2)
 
   alpha = 0.2
-  return alpha * timeLoss + fockIndexEntropy # + cceEntropy
+  return alpha * timeLoss + fockIndexEntropy + cceEntropy
 
 model.compile(optimizer='adam', loss=lossfn, metrics=['accuracy'])
 
