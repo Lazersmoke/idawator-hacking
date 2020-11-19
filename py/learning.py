@@ -3,36 +3,50 @@ import matplotlib.pyplot as plt
 import tensorflow as tf
 from tensorflow import keras
 from tensorflow.keras import layers
-from mido import MidiFile
+from mido import MidiFile, Message, MidiTrack
 import os
 
-# Midi should have octave in integers [0,10] (so eleven octaves)
-# Returns (octave,pitchClass)
-def midiNoteToRepr(midiNote):
-  return divmod(midiNote,12)
+np.set_printoptions(precision=2)
 
+# This is the size of the Fock space of simulatneous notes
+# The Fock space should be thought of as:
+# (note) `direct sum` (note X note) `direct sum` (note X note X note) ...
+# Up to the fockSize-fold cartesian product: \prod_{i=1}^fockSize note_i
 fockSize = 10
-# 12 pitch classes, and 11 octaves
+
+# A single note in the fock representation described above
+# 12 pitch classes, and 11 octaves, one-hot encoding
+# 11 octaves because MIDI comes in [0,127], last octave is [121,127]
 singleNoteSize = 12 + 11
+
+# Compute some constants based on the fockSize and singleNoteSize
 totalFockSize = 0
 fockOffsets = []
 for i in range(fockSize):
   fockOffsets.append(totalFockSize)
   totalFockSize += (i + 1) * singleNoteSize
+# Include the ending offset; this is useful sometimes
 fockOffsets.append(totalFockSize)
 
-# Add in the time density
-maxTimeDensity = 200
-useCategoricalTime = False
-if useCategoricalTime:
-  timeDensitySize = maxTimeDensity // 4
-  noteSpecSize = timeDensitySize + totalFockSize
-else:
-  noteSpecSize = 1 + totalFockSize
-
+# totalFockSize is the dimension of the Fock space
 print("Total fock size is {}".format(totalFockSize))
+
+# fockOffsets holds the offsets to the different direct summands of the Fock space
+# The summand with k simultaneous notes is between fockOffsets[k-1] and fockOffsets[k]
 print("Fock offsets are {}".format(fockOffsets))
 
+# Add in the time density as an extra dimension
+# Time density is the amount of time that this particular chunk of
+# the MIDI takes up (in midi ticks). It's a density because the non-uniform
+# MIDI is being squished and stretched to be uniform (timeseries)
+# so we need to keep the density of that embedding around
+
+# NoteSpec = (Time part) `direct sum` (Fock space)
+# Note that it is not one-hot encoded
+noteSpecSize = 1 + totalFockSize
+
+# Convert a midi note in [0,127] to a one-hot encoded
+# vector of size singleNoteSize
 def midiNoteToSingleNoteChunk(midiNote):
   (octave,pitchClass) = divmod(midiNote,12)
   vec = np.zeros(singleNoteSize)
@@ -40,89 +54,106 @@ def midiNoteToSingleNoteChunk(midiNote):
   vec[12 + octave] = 1
   return vec
 
-# Build a NoteSpec out of the current midi situation during this particular epoch
+# Build a NoteSpec out of the current midi situation during this particular chunk of midi
 def mkNoteSpec(heldNotes,decayingNotes,timeDensity):
+  # We don't distinguish between notes that are being freshly played right now
+  # and those which are now in the release stage of ADSR
   allNotes = heldNotes + decayingNotes
   fockVec = np.zeros(totalFockSize)
+  # If there are more simultaneous notes than fockSize, we can't represent it
+  # The current solution is to arbitrarily drop them by slicing the list
+  # This isn't particularly stable due to heldNotes being in potentially arbitrary orders
   if len(allNotes) > fockSize:
-    #print("!!! Fock size of {} exceeded by {} simultaneous notes; dropping {} notes !!!".format(fockSize,len(allNotes), len(allNotes) - fockSize))
     allNotes = allNotes[:fockSize]
+    # This print statement will bottleneck your parsing in some cases
+    #print("!!! Fock size of {} exceeded by {} simultaneous notes; dropping {} notes !!!".format(fockSize,len(allNotes), len(allNotes) - fockSize))
+
+  # Decide which direct summand of the fock space we fall under
   startIdx = fockOffsets[len(allNotes) - 1]
+  # Place each currently playing note into the correct slot
   for i in range(len(allNotes)):
     fockVec[startIdx + i * singleNoteSize : startIdx + (i + 1) * singleNoteSize] = midiNoteToSingleNoteChunk(allNotes[i])
-  if useCategoricalTime:
-    timeVec = np.zeros(timeDensitySize)
-    timeVec[(timeDensity // 4) - 1] = 1
-    return np.insert(fockVec,0,timeVec)
-  else:
-    return np.insert(fockVec,0,timeDensity)
+  # Include the time density in front of the fock vector to make this a NoteSpec
+  return np.insert(fockVec,0,timeDensity)
 
+# Given a MIDI filename on disk, get the list of tracks
 def getTracksFromMidi(filename,verbose=False):
   mid = MidiFile(filename)
   tracks = []
-  minTrackSize = 200
   for i, track in enumerate(mid.tracks):
     if verbose:
       print('Track {}: {}'.format(i, track.name))
+    # The notes that are currently being played
+    # This must be tracked between midi messages
     heldNotes = []
+    # Notes that are turning off
     toUnHold = []
     lastTime = 0
     noteSpecs = []
     for msg in track:
-      if msg.time != 0:
+      # MIDI typically issues several commands with time=0, and the last one with
+      # time equal to the time until the next command in midi ticks
+      # If the time isn't zero, then we have all the commands from this chunk
+      # and it's time to write it out
+
+      # On top of this, we treat anything short of 4 midi ticks as essentially happening in zero time.
+      if msg.time > 3:
+        # Cap the time density so that pathologically long
+        # notes in the data don't destroy everything
+        maxTimeDensity = 200
         noteSpec = mkNoteSpec(heldNotes,toUnHold,min(lastTime,maxTimeDensity))
         noteSpecs.append(noteSpec)
+
+        # Formally advance the time to the next chunk
+        lastTime = msg.time
+
+        # All the notes that were turning off in the last chunk are now fully off
         for n in toUnHold:
           if n in heldNotes:
             heldNotes.remove(n)
         toUnHold = []
-        lastTime = msg.time
-      if msg.type == 'note_on':
-        #print("Note",msg.note,"on with time=",msg.time)
-        if msg.note not in heldNotes:
-          heldNotes.append(msg.note)
-      elif msg.type == 'note_off':
-        #print("Note",msg.note,"off with time=",msg.time)
-        if msg.note in heldNotes:
-          toUnHold.append(msg.note)
-      else:
-        #print(msg)
-        x=1
+
+      # Adjust the note states based on the MIDI message
+      if msg.type == 'note_on' and msg.note not in heldNotes:
+        heldNotes.append(msg.note)
+      elif msg.type == 'note_off' and msg.note in heldNotes:
+        toUnHold.append(msg.note)
+
     if verbose:
       print("Found {} Note Specs".format(len(noteSpecs)))
+
+    # Too-short tracks are typically like effect tracks
+    # or other weird things that we don't want to learn on
+    minTrackSize = 200
     if(len(noteSpecs) >= minTrackSize):
       tracks.append(np.stack(noteSpecs,axis=0))
     elif verbose:
       print("Track Discarded XXX")
   return tracks
 
-def mkDatasetFromTrack(noteSequence):
-  # The maximum length sentence you want for a single input in characters
-  seq_length = 20
-  examples_per_epoch = len(noteSequence)//(seq_length+1)
+# Create a tensorflow dataset of prediction examples (ie, flashcards)
+# based on the given track (which is just a list of NoteSpec's)
+def mkDatasetFromTrack(track):
+  # The length in NoteSpec's of sequences that we should (a) learn on and (b) generate
+  seq_length = 50
 
-  # Create training examples / targets
-  sequences = tf.data.Dataset.from_tensor_slices(noteSequence).batch(seq_length+1, drop_remainder=True)
+  # Chop up the input track into slices
+  # Makes about len(track)/(seq_length + 1) examples out of the track
+  sequences = tf.data.Dataset.from_tensor_slices(track).batch(seq_length+1, drop_remainder=True)
 
+  # For each example we have:
+  # input is  [n    ,    n + seq_length]
+  # output is [1 + n,1 + n + seq_length]
   def split_input_target(chunk):
     inputNoteSeq = chunk[:-1]
     targetNoteSeq = chunk[1:]
     return inputNoteSeq, targetNoteSeq
 
+  # Turn the database of slices into a database of examples
   dataset = sequences.map(split_input_target)
-
-  # Batch size
-  BATCH_SIZE = 10
-
-  # Buffer size to shuffle the dataset
-  # (TF data is designed to work with possibly infinite sequences,
-  # so it doesn't attempt to shuffle the entire sequence in memory. Instead,
-  # it maintains a buffer in which it shuffles elements).
-  BUFFER_SIZE = 100
-
-  dataset = dataset.shuffle(BUFFER_SIZE).batch(BATCH_SIZE, drop_remainder=True)
   return dataset
 
+# Get the database of examples for a midi file
 def fileToData(filename):
   tracks = getTracksFromMidi(filename)
   dataset = None
@@ -130,86 +161,172 @@ def fileToData(filename):
     if dataset is None:
       dataset = mkDatasetFromTrack(track)
     else:
-      dataset.concatenate(mkDatasetFromTrack(track))
+      dataset = dataset.concatenate(mkDatasetFromTrack(track))
   return dataset
 
-max_files = 5
+# Use up to this many files from the "midis" folder
+# to build the database of examples
+max_files = 100
 dataset = None
 for filename in os.listdir("midis"):
   max_files -= 1
   if max_files < 0:
     break
   fullPath = os.path.join("midis",filename)
+  if not os.path.isfile(fullPath):
+    continue
   print("Using",fullPath)
   try:
     fileSet = fileToData(fullPath)
     if dataset is None:
       dataset = fileSet
-    else:
-      dataset.concatenate(fileSet)
+    elif fileSet is not None:
+      dataset = dataset.concatenate(fileSet)
+  # Some MIDI files have data values > 127, which the mido library doesn't like
+  # so it throws these errors. We catch them and ignore the culprit file
   except ValueError as err:
-    print("!!! Error dealing with midi file:",fullPath)
+    print("!!! ValueError dealing with midi file:",fullPath)
+    print("!!!",err)
+  except OSError as err:
+    print("!!! OSError dealing with midi file:",fullPath)
     print("!!!",err)
 
-dataset = dataset.shuffle(100)
-print("Dataset cardinality:",dataset.cardinality().numpy())
+# Batch the dataset into chunks of 50 examples each to make training more managable
+dataset = dataset.shuffle(100).batch(50, drop_remainder=True)
 
+# Switch to use fewer than the full dataset for fast training
+max_batches = 0
+if max_batches > 0:
+  dataset = dataset.take(max_batches)
 
-
-#if useCategoricalTime:
-#  print(tracks[1][:,:timeDensitySize])
-#else:
-#  print(tracks[1][:,0])
-
+# Our model!
 model = keras.Sequential()
+# Input is some sequence of NoteSpec's of unspecified length
 model.add(layers.InputLayer(input_shape=(None,noteSpecSize)))
+# Use a Bidirectional LSTM to remember states an all that good stuff
 model.add(layers.Bidirectional(layers.LSTM(512,return_sequences=True)))
+# The dropout layer prevents overfitting (via black magic)
 model.add(layers.Dropout(0.2))
+# A finalizing simple neural network layer using relu because relu is love relu is life
 model.add(layers.Dense(noteSpecSize,activation = 'relu'))
 
 model.summary()
 
-def postProcess(timeAndLogits):
-  if useCategoricalTime:
-    return tf.nn.softmax(timeAndLogits).numpy()
-  else:
-    return (timeAndLogits[0],tf.nn.softmax(timeAndLogits[1:]).numpy())
+# Write out a sequence of NoteSpec's to MIDI (using maximum probabilities)
+# Technically this is wrong and we should sample instead, but this works OK
+def writeBatch(batch,from_logits=True,title="batch"):
+  mid = MidiFile()
+  track = MidiTrack()
+  mid.tracks.append(track)
+  # Set grand piano
+  track.append(Message('program_change', program=1, time=0))
+  # volume up
+  track.append(Message('control_change', control=7, value=127, time=0))
+  # sustain pedal??
+  # The dataset MIDIs do this and it seems to help
+  track.append(Message('control_change', control=64, value=127, time=0))
 
-def displayBatch(batch,from_logits=False,title=""):
+  # This is almost exactly the inverse of the MIDI parsing stuff
+  heldNotes = []
+  for i in range(batch.shape[0]):
+    timeDensity = batch[i,0].numpy()
+    fockNote = batch[i,1:]
+    fockIdx = maxFockIdx(fockNote,from_logits)
+    newNotes = []
+    for j in range(fockIdx + 1):
+      thisNote = fockNote[fockOffsets[fockIdx] + j * singleNoteSize : fockOffsets[fockIdx] + (j + 1) * singleNoteSize]
+      pitchPart = thisNote[:12]
+      octavePart = thisNote[12:]
+
+      # Here's where we forget anything with less than maximal probability
+      bestPitch = np.argmax(pitchPart)
+      bestOctave = np.argmax(octavePart)
+
+      chosenMidiNote = 12 * bestOctave + bestPitch
+      newNotes.append(chosenMidiNote)
+
+    for oldNote in heldNotes[:]:
+      if oldNote not in newNotes:
+        heldNotes.remove(oldNote)
+        track.append(Message('note_off', note=min(oldNote,127), velocity=127, time=0))
+      else:
+        newNotes.remove(oldNote)
+
+    for newNote in newNotes:
+      #print("Outputing note",newNote)
+      track.append(Message('note_on', note=min(newNote,127), velocity=64, time=0))
+      heldNotes.append(newNote)
+
+    track[-1].time = 16 * max(int(timeDensity),1)
+
+  mid.save(title + '.mid')
+
+# Helper to extract the most likely fock index (= note count - 1) from a
+# fock probability vector that might be using logits
+def maxFockIdx(fockNote, from_logits = True):
+  probs = []
+  for i in range(fockSize):
+    if from_logits:
+      probs.append(np.sum(tf.nn.softmax(fockNote[fockOffsets[i] : fockOffsets[i + 1]]).numpy()))
+    else:
+      probs.append(np.sum(fockNote[fockOffsets[i] : fockOffsets[i + 1]]))
+  return np.argmax(probs)
+
+# Display a sequence of NoteSpec's by printing it out, graphing it in a scatter plot, and writing a file
+def displayBatch(batch,from_logits=True,title="batch"):
   print("Time densities:")
   print(batch[:,0].numpy())
   if from_logits:
     probs = tf.nn.softmax(batch[:,1:]).numpy()
   else:
-    probs = batch[:,1:]
-  #print(probs)
-  #print(probs.shape)
-  plt.scatter(range(len(probs[-1])),np.log(probs[-1] + 1))
+    # Add epsilon to not break the plot axis
+    probs = batch[:,1:] + 1e-7
+  plt.scatter(range(len(probs[-1])),np.log(probs[-1]),label=title)
+  writeBatch(batch,from_logits)
 
-def displayAbout(model):
-  for input_example_batch, target_example_batch in dataset.take(1):
-    example_batch_predictions = model(input_example_batch)
-    #print(example_batch_predictions.shape, "# (batch_size, sequence_length, vocab_size)")
-    print("Input:")
-    displayBatch(input_example_batch[0])
+# Display some information about the model with
+# its current parameters. Shows an example from the dataset
+# and how well it is predicted by the model
+def displayAbout(model,title="Model"):
+  for exampleInput, target in dataset.take(1):
+    predict = model(exampleInput)
+
+    #print("Input:")
+    #displayBatch(exampleInput[0],from_logits=False,title="Input")
+    #print()
+
+    print("Target:")
+    displayBatch(target[0],from_logits=False,title="Target")
     print()
+
     print("Predictions:")
-    displayBatch(example_batch_predictions[0],from_logits=True)
-    plt.title("Inputs vs predictions")
+    displayBatch(predict[0],from_logits=True,title="Predictions")
+    print()
+
+    plt.title(title)
+    plt.legend()
     plt.show(block=True)
-    plt.title("Time density distribution comparison")
-    plt.hist([input_example_batch[0][:,0],example_batch_predictions[0][:,0]],label=["Actual time density distribution","Predicted time density distribution"])
+    plt.title("Time density distribution comparison for " + title)
+    plt.hist([target[0][:,0],predict[0][:,0]],label=["Target time density distribution","Predicted time density distribution"])
     #plt.vlines([np.mean(input_example_batch[0][:,0])],label="Mean actual time density")
     plt.legend()
     plt.show(block=True)
 
+# The big loss function
+# Everything in here operates on symbolic, differentiable tensors
+# So the code is quite constrained
+# It also takes in an entire batch at once, hence all the [:,:,x] stuff
 def lossfn(actual, pred):
+
+  # First, compute the squared error loss for the time density
   predTimeDensity = pred[:,:,0]
   actualTimeDensity = actual[:,:,0]
-  alpha = 0.2
   timeLoss = (predTimeDensity - actualTimeDensity) * (predTimeDensity - actualTimeDensity)
-  beta = 0.5
-  timeShapeLoss = tf.keras.losses.kullback_leibler_divergence(actualTimeDensity,predTimeDensity)
+
+  #timeShapeLoss = tf.keras.losses.kullback_leibler_divergence(actualTimeDensity,predTimeDensity)
+
+  # Next, compute the categorical entropy stuff
+  # Firstly, for the fock index, and secondly for the pitch class and octave therein
   fockProbsAct = []
   fockProbsPre = []
   cce = []
@@ -217,20 +334,24 @@ def lossfn(actual, pred):
     startIdx = 1 + fockOffsets[i]
     endIdx = 1 + fockOffsets[i + 1]
     fockProbsAct.append(tf.keras.backend.sum(actual[:,:,startIdx : endIdx],axis=2))
-    fockProbsPre.append(tf.keras.backend.sum(pred[:,:,startIdx : endIdx],axis=2))
-    cce.append(tf.keras.losses.categorical_crossentropy(actual[:,:,startIdx : endIdx], pred[:,:, startIdx : endIdx], from_logits=True))
+    fockProbsPre.append(tf.keras.backend.sum(tf.nn.softmax(pred[:,:,startIdx : endIdx]),axis=2))
+
+    # Hacky way to make it compute the p \cdot log q stuff
+    stacked = tf.stack([actual[:,:,startIdx : endIdx], tf.keras.backend.log(tf.nn.softmax(pred[:,:, startIdx : endIdx]))],axis=2)
+    cce.append(tf.keras.backend.sum(-tf.keras.backend.prod(stacked,axis = 2),axis=2))
+
   fockProbsActTensor = tf.keras.backend.stack(fockProbsAct,axis=2)
   fockProbsPreTensor = tf.keras.backend.stack(fockProbsPre,axis=2)
   cceTensor = tf.keras.backend.stack(cce,axis=2)
   actualFockIdx = tf.math.argmax(fockProbsActTensor,axis=2)
+
   # This is the entropy from correctly categorizing the number of notes to play simultaneously
   fockIndexEntropy = -tf.math.log(tf.gather(fockProbsPreTensor,actualFockIdx,batch_dims=2))
 
   cceEntropy = tf.gather(cceTensor,actualFockIdx,batch_dims=2)
 
-  #cce = tf.keras.losses.categorical_crossentropy(actual[:,:,1:], pred[:,:,1:], from_logits=True)
-  return alpha * timeLoss + fockIndexEntropy + cceEntropy
-
+  alpha = 0.2
+  return alpha * timeLoss + fockIndexEntropy # + cceEntropy
 
 model.compile(optimizer='adam', loss=lossfn, metrics=['accuracy'])
 
@@ -244,30 +365,29 @@ checkpoint_callback = tf.keras.callbacks.ModelCheckpoint(
     filepath=checkpoint_prefix,
     save_weights_only=True)
 
-if input("Go?") != "y":
+# If the checkpoint directory exists, try to load weights from it
+# To not use the old checkpoint, just delete the directory
+if os.path.isdir(checkpoint_dir):
+  model.load_weights(tf.train.latest_checkpoint(checkpoint_dir))
+
+def sampleForwardModel(model,n=50):
+  for inp, tar in dataset.take(1):
+    x = inp
+    for i in range(50):
+      x = model(x)
+    displayBatch(x)
+
+displayAbout(model,title="Existing model")
+sel = input("Go?")
+
+if len(sel) > 0 and sel[0] == "g":
+  sampleForwardModel(model)
+
+if sel != "y":
   quit()
 
-#model.load_weights(tf.train.latest_checkpoint(checkpoint_dir))
+model.fit(dataset, epochs=5, callbacks=[checkpoint_callback])
 
-displayAbout(model)
-
-model.fit(dataset, epochs=10, callbacks=[checkpoint_callback])
-
-#model.evaluate(dataset)
-displayAbout(model)
-
-def writeBatch(batch,from_logits=False,title=""):
-  heldNotes = []
-  for i in range(len(batch[:,0])):
-    timeDensity = batch[i,0]
-  #print("Time densities:")
-  #print(batch[:,0].numpy())
-  #if from_logits:
-  #  probs = tf.nn.softmax(batch[:,1:]).numpy()
-  #else:
-  #  probs = batch[:,1:]
-  #print(probs)
-  #print(probs.shape)
-  #plt.scatter(range(len(probs[0])),np.log(probs[0]))
-
+print(model.evaluate(dataset))
+displayAbout(model,title="Newly trained model")
 
