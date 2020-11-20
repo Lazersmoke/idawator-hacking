@@ -102,8 +102,10 @@ def getTracksFromMidi(filename,verbose=False):
         # Cap the time density so that pathologically long
         # notes in the data don't destroy everything
         maxTimeDensity = 200
-        noteSpec = mkNoteSpec(heldNotes,toUnHold,min(lastTime,maxTimeDensity))
-        noteSpecs.append(noteSpec)
+
+        if len(heldNotes) + len(toUnHold) > 0:
+          noteSpec = mkNoteSpec(heldNotes,toUnHold,min(lastTime,maxTimeDensity))
+          noteSpecs.append(noteSpec)
 
         # Formally advance the time to the next chunk
         lastTime = msg.time
@@ -167,7 +169,7 @@ def fileToData(filename):
 
 # Use up to this many files from the "midis" folder
 # to build the database of examples
-max_files = 20
+max_files = 50
 dataset = None
 midiFiles = os.listdir("clean_midi")
 np.random.shuffle(midiFiles)
@@ -193,12 +195,19 @@ for filename in midiFiles:
   except OSError as err:
     print("!!! OSError dealing with midi file:",fullPath)
     print("!!!",err)
+  except:
+    print("!!! Other error dealing with midi file:",fullPath)
+
+# Peel off the validation set
+validationSet = dataset.shard(num_shards=2,index=1).batch(50)
+dataset = dataset.shard(num_shards=2,index=0)
 
 # Batch the dataset into chunks of 50 examples each to make training more managable
 dataset = dataset.shuffle(100).batch(50, drop_remainder=True)
 
+
 # Switch to use fewer than the full dataset for fast training
-max_batches = 0
+max_batches = 10
 if max_batches > 0:
   dataset = dataset.take(max_batches)
 
@@ -246,7 +255,8 @@ def writeBatch(batch,from_logits=True,title="batch"):
       bestOctave = np.argmax(octavePart)
 
       chosenMidiNote = 12 * bestOctave + bestPitch
-      newNotes.append(chosenMidiNote)
+      if chosenMidiNote > 0:
+        newNotes.append(chosenMidiNote)
 
     for oldNote in heldNotes[:]:
       if oldNote not in newNotes:
@@ -292,7 +302,7 @@ def displayBatch(batch,from_logits=True,title="batch"):
 # its current parameters. Shows an example from the dataset
 # and how well it is predicted by the model
 def displayAbout(model,title="Model"):
-  for exampleInput, target in dataset.take(1):
+  for exampleInput, target in validationSet.take(1):
     predict = model(exampleInput)
 
     #print("Input:")
@@ -390,7 +400,7 @@ if os.path.isdir(checkpoint_dir):
   model.load_weights(tf.train.latest_checkpoint(checkpoint_dir))
 
 def sampleForwardModel(model,n=50):
-  for inp, tar in dataset.take(1):
+  for inp, tar in validationSet.take(1):
     x = inp
     for i in range(50):
       x = model(x)
@@ -407,6 +417,6 @@ if sel != "y":
 
 model.fit(dataset, epochs=5, callbacks=[checkpoint_callback])
 
-print(model.evaluate(dataset))
+print(model.evaluate(validationSet))
 displayAbout(model,title="Newly trained model")
 
